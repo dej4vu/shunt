@@ -10,8 +10,9 @@
 //! are CSRF-exempt (no ambient cookie).
 //! An admin credential is either a `tokens_env`/`tokens_file` `name:token` pair
 //! or a `[[server.admin.write_keys]]`/`[[server.admin.read_keys]]` entry; the
-//! read tier passes every GET and is refused on every mutation, the login form
-//! included.
+//! read tier passes every GET and is refused on every mutation. It signs in at
+//! the login form too: the session records the tier it was minted with, so a
+//! read key's cookie is refused on a mutation exactly as its header is.
 //! Built with `--features ui`, the SPA shell and its bundle files are the one
 //! part of this surface served without any admin credential — they carry no
 //! operator data, and everything the SPA reads sits behind `/admin/api/*`,
@@ -192,12 +193,17 @@ impl AdminAuth {
             })
     }
 
-    /// Whether a raw token (from the login form) may mint a browser session.
-    /// Read-tier credentials may not: a session carries full access today, so
-    /// minting one from a read key would silently escalate it to write.
-    fn authenticate_login_token(&self, token: &str) -> bool {
+    /// The privilege a raw token (from the login form) may mint a browser
+    /// session with, or `None` when it is not an admin credential at all.
+    ///
+    /// A read-tier credential mints a *read-tier* session. That is safe only
+    /// because [`SessionStore`](session::SessionStore) records the tier and
+    /// [`authenticate`] reads it back: while a session carried full access
+    /// unconditionally, minting one from a read key silently escalated it to
+    /// write, which is why this used to refuse them outright.
+    fn login_access(&self, token: &str) -> Option<AdminAccess> {
         self.authenticate_value(token.as_bytes())
-            .is_some_and(|credential| credential.access >= AdminAccess::Write)
+            .map(|credential| credential.access)
     }
 }
 
@@ -327,13 +333,16 @@ pub(super) fn authenticate(state: &AppState, headers: &HeaderMap) -> Option<Auth
         });
     }
     let sid = session_cookie(headers)?;
-    let csrf = state.admin_stores.sessions.csrf_for(&sid)?;
+    let session = state.admin_stores.sessions.lookup(&sid)?;
     Some(AuthOk {
-        kind: Authenticated::Session { csrf },
+        kind: Authenticated::Session { csrf: session.csrf },
         auth,
-        // A session can only be minted by a write-tier credential or OIDC
-        // (`login_submit`, `oidc::callback`), so it carries full access.
-        access: AdminAccess::Write,
+        // The tier the minting credential carried, not a constant: `read_keys`
+        // sign in too (`login_submit`), so a cookie no longer implies write.
+        // Every mutation still goes through `require_write`, which is what
+        // makes a read session read-only on the server rather than by the
+        // dashboard's good manners.
+        access: session.access,
     })
 }
 
@@ -597,6 +606,25 @@ async fn login_submit(
     let Some(auth) = state.admin_auth.clone() else {
         return not_found();
     };
+    // Same-origin, for the same reason [`logout`] checks it: this is a
+    // navigation form POST, so it carries no `x-csrf-token`, and `SameSite=Strict`
+    // governs whether the browser *sends* an existing cookie -- not whether it
+    // stores the `Set-Cookie` this hands back. Without the guard a cross-site
+    // page could submit a token it holds and overwrite the visitor's session
+    // with one of its own choosing.
+    //
+    // That became worth guarding when `read_keys` gained the ability to sign in:
+    // a read key is handed to someone deliberately given less privilege, and
+    // this was the one lever it had against a write operator -- silently
+    // downgrading their dashboard to read-only until they signed in again. A
+    // write-key holder could always do this, but gains nothing by it.
+    //
+    // Non-browser callers are unaffected: `same_origin` returns `true` when
+    // neither `Sec-Fetch-Site` nor `Origin` is present, so a scripted login
+    // still works.
+    if !same_origin(&headers) {
+        return forbidden("cross-origin admin request rejected");
+    }
     // Throttle admin-token guessing (defense-in-depth behind the constant-time
     // compare); every POST counts, before the token is checked.
     if !state.admin_stores.login_rate.check() {
@@ -606,14 +634,17 @@ async fn login_submit(
         Ok(Form(form)) => form.token,
         Err(_) => String::new(),
     };
-    if !auth.authenticate_login_token(&token) {
+    let Some(access) = auth.login_access(&token) else {
         return login_response(
             StatusCode::UNAUTHORIZED,
             Some("Invalid admin token."),
             auth.oidc().map(crate::gateway::ResolvedIdp::button_label),
         );
-    }
-    let (sid, _csrf) = state.admin_stores.sessions.create(auth.session_ttl());
+    };
+    let (sid, _csrf) = state
+        .admin_stores
+        .sessions
+        .create(auth.session_ttl(), access);
     let cookie = set_cookie(&sid, secure_cookie(&headers), auth.session_ttl());
     (
         StatusCode::SEE_OTHER,
@@ -682,9 +713,10 @@ async fn dashboard() -> Response {
 
 // --- JSON API routes -----------------------------------------------------------
 
-/// `GET /admin/api/session` — the two per-session values the dashboard needs
+/// `GET /admin/api/session` — the three per-session values the dashboard needs
 /// before it can render, for a client that cannot have them interpolated into
-/// its own source.
+/// its own source: the CSRF token, the session's access tier, and the refresh
+/// buffer.
 ///
 /// The server-rendered dashboard this replaced substituted both into the page
 /// it emitted. The SPA shell (`ui::shell`) cannot be served that way: it is one
@@ -713,6 +745,10 @@ async fn session_bootstrap(State(state): State<AppState>, headers: HeaderMap) ->
     };
     json_secure(json!({
         "csrf": csrf,
+        // The dashboard renders write affordances from this. It is a display
+        // signal only -- `require_write` is the enforcement, and a client that
+        // ignored this field would get `403`s rather than extra powers.
+        "access": authok.access,
         // Served rather than duplicated in the bundle for the same reason the
         // server-rendered page substituted it: the dashboard reports a setup
         // token as expired once it is inside this buffer, and routing refuses
