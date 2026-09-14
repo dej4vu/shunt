@@ -921,8 +921,30 @@ consume the entry and `complete_account` removes it only after the store, so a
 start issued during an in-flight exchange replaces the entry and lets a second
 completion pass its own state check — both exchanges then reach the store in an
 order nothing constrains, and the older one landing last leaves the account
-holding the superseded credential. Serializing the page's completions is what
-keeps that sequence out of reach.
+holding the superseded credential.
+
+The page's marker cannot be what keeps that sequence out of reach, because it
+only binds one page: a second tab, a second operator, or a direct API call is
+subject to none of it, and the abort bound below releases the marker while the
+server may still be exchanging. So the ordering is server-side. Each completion
+holds `PendingStore::lock_completion` for its whole `attempt` → exchange → store
+→ remove sequence, keyed by the pending key, so a second completion waits and
+then finds the entry already consumed and fails closed with "start again"
+(issue #440). The marker stays as what it always was locally — a refusal that
+costs no round-trip — rather than the thing that orders the mutations.
+
+The lock is bounded by the exchange it holds. `COMPLETION_EXCHANGE_TIMEOUT` caps
+that upstream exchange at 30 seconds, so a hung provider releases the lock with a
+`502` instead of parking every later completion for that key behind it for as long
+as the connection stays open. The pending entry survives the timeout — the attempt
+still counts against `MAX_PENDING_ATTEMPTS` — but the authorization code may
+already be spent upstream, so the recovery is a fresh start rather than re-posting
+the same code.
+
+`start` deliberately does not take that lock: blocking a start behind an
+in-flight exchange would stall the operator for up to the completion's own
+timeout, and two racing *starts* already fail closed on the state check, which
+is why ordering them is tracked separately rather than here.
 
 Nothing else may release the marker, so the completion request carries its own
 120-second `AbortController` bound, cleared in a `finally`: a connection that
@@ -934,10 +956,9 @@ not agree with.
 The marker is a per-page-load convenience, not an enforceable lock: it is a
 `let` in the inline script, so reloading the dashboard clears it and permits the
 same retry the bound does. Being page-local it also cannot see a second tab or a
-direct API call, and the server orders nothing. Its job is only to keep one
-page's own two clicks from racing; ordering concurrent completions is
-server-side work, tracked in
-[issue #440](https://github.com/pleaseai/shunt/issues/440).
+direct API call. Its job is only to keep one page's own two clicks from racing;
+ordering concurrent completions is the server's, through the per-pending-key
+lock described above.
 
 Both are deliberately confined to the managed store tables: the observed rows in
 the top-level **Accounts and usage** table are unchanged, since those credentials
