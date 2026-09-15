@@ -12,18 +12,13 @@
 //! inconclusive; shunt declines and falls open to the picker's default instead,
 //! which keeps the hot path free of an extra request and an extra credential.
 
-// Nothing routes through this module yet: the decision is wired into
-// `resolve_model_chain` in a later change, deliberately kept separate so the
-// scorer and its tests land — and can be measured against real transcripts —
-// without altering how a single request is routed. Remove this attribute in the
-// change that adds the caller; it must not outlive it.
-#![allow(dead_code)]
-
 mod signals;
 mod store;
 mod vocabulary;
 
 pub(crate) use store::StageRouterStore;
+
+use std::{cell::Cell, time::Instant};
 
 use serde_json::Value;
 use switchyard_libsy::{pick_tier, DecisionSource, PickOutcome, PickerMode, Tier};
@@ -56,6 +51,79 @@ impl StageTier {
             StageTier::Efficient => &router.efficient_target,
         }
     }
+}
+
+/// Everything a live request carries that a body-less caller does not.
+///
+/// Held by reference for the length of one routing call; nothing here is stored.
+pub(crate) struct StageContext<'a> {
+    /// Process-lifetime pins, from `AppState`.
+    pub store: &'a StageRouterStore,
+    /// The parsed request body. `messages` is read out of it for scoring; a
+    /// request without that field simply yields no signals.
+    pub request: &'a Value,
+    /// `x-claude-code-session-id`. Absent for callers that send no session
+    /// header, which are then routed statelessly.
+    pub session_id: Option<&'a str>,
+    /// Set for `count_tokens`, which must reach the same tier as the real turn
+    /// without recording it.
+    pub read_only: bool,
+    /// Request-entry clock, shared with the rest of the request's timing.
+    pub now: Instant,
+    /// The pin [`select`] decided this request earns, parked until the request
+    /// is admitted. Routing runs before inbound auth and the managed-model
+    /// policy — those need the resolved chain — so writing it here would let a
+    /// request that is about to be rejected pin, evict, or steer a session it
+    /// never proved it owns. [`StageContext::commit`] writes it once the
+    /// request is known to be served.
+    pub pending: Cell<Option<store::PendingPin>>,
+}
+
+impl StageContext<'_> {
+    /// Write the pin this request earned. Called after inbound auth and the
+    /// managed-model policy have admitted it, and a no-op for every request
+    /// that earned none — a read-only `count_tokens` probe, a caller with no
+    /// session header, and any id the router never looked at.
+    ///
+    /// Admission, not a successful upstream response, is the boundary: the tier
+    /// chosen here is the tier the turn was dispatched at, and an upstream 500
+    /// afterwards is not evidence that the choice was wrong.
+    pub(crate) fn commit(&self) {
+        if let Some(pin) = self.pending.replace(None) {
+            self.store.commit(pin, self.now);
+        }
+    }
+}
+
+/// Resolve a router to the tier that serves this request.
+///
+/// `context` is `None` for the body-less entry points — `/routes`, discovery,
+/// and the public [`crate::routing::resolve_model`] — which have no conversation
+/// to score and no session to pin, and so report the picker's default. That is
+/// the right answer for those surfaces: the tier a fresh session starts on.
+pub(crate) fn select(
+    router: &StageRouterConfig,
+    model: &str,
+    context: Option<&StageContext<'_>>,
+) -> StageDecision {
+    let Some(context) = context else {
+        return decide(router, None);
+    };
+
+    let estimate = decide(router, context.request.get("messages"));
+    let (decision, pin) = context.store.apply(
+        model,
+        context.session_id,
+        router,
+        estimate,
+        context.read_only,
+        context.now,
+    );
+    // Parked, not written: see [`StageContext::pending`]. Validation forbids a
+    // router whose target is itself a router, so one request reaches this line
+    // at most once and no earlier pin can be dropped here.
+    context.pending.set(pin);
+    decision
 }
 
 /// Pick a tier for a request from its conversation so far.

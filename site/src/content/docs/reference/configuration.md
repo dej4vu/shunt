@@ -594,15 +594,17 @@ codex = "gpt-5.2"
 
 ### `[models.stage_router]` (optional)
 
-Content-aware tier selection for one advertised id: instead of naming a single
-destination, the entry names **two** — a capable tier and an efficient one.
+Content-aware tier selection for one advertised id. Instead of naming a single
+destination, the entry names **two** — a capable tier and an efficient one — and
+lets the request's recent tool-result history pick between them per turn. Absent
+this table a `[[models]]` entry behaves exactly as it did before; configure no
+router anywhere and routing is unchanged.
 
-**Not active in this release.** The table is parsed and validated, but the
-resolver does not read it yet, so an id carrying this table still routes by that
-literal id through the ordinary `[[routes]]` / prefix / `default_provider`
-ladder — not to either target. The keys are documented here so a configuration
-can be written and reviewed ahead of the change that activates them. Absent this
-table a `[[models]]` entry behaves exactly as it did before.
+Both targets are ordinary public model ids, so each resolves through the normal
+ladder and keeps its failover chain, account pool, adapter, `effort`, and
+`service_tier`. What the client is told it got stays the id it asked for — the
+tier travels upstream only. See the [stage router guide](/guides/stage-router/)
+for how the signals and the hysteresis work.
 
 ```toml
 [[models]]
@@ -622,7 +624,7 @@ efficient_target = "claude-sonnet-4-6"
 | `confidence_threshold` | `0.5` | Minimum scorer confidence to act on a signal, in `(0.0, 1.0]` |
 | `recent_turn_window` | `3` | Assistant turns of tool results fed to the scorer. Must be at least `1` |
 | `min_dwell_turns` | `3` | Turns a tier is held before a de-escalation may fire; counted from the turn that chose it, so `0` and `1` both mean no dwell floor |
-| `deescalate_threshold` | `0.75` | Confidence required to move *down* a tier. The default sits above `confidence_threshold`'s, making the down direction the harder one, but the two are range-checked independently — a value below `confidence_threshold` is accepted |
+| `deescalate_threshold` | `0.75` | Confidence required to move *down* a tier. The default sits above `confidence_threshold`'s, making the down direction the harder one, but the two are range-checked independently — a value below `confidence_threshold` is accepted, and warns at load |
 | `session_ttl_seconds` | `3600` | How long a quiet session's pinned tier survives |
 
 A target that is itself a router, a blank target, a threshold outside
@@ -633,8 +635,17 @@ entries may otherwise share an id, but a router names a routing policy rather
 than discovery metadata, so a duplicate would leave two policies for one id.
 Target ids are compared after the trailing `[1m]`/`[1M]` hint is stripped, the
 same way
-routing matches them. A target that matches no explicit route only warns — it
-still resolves through `server.default_provider` like any other unmatched id.
+routing matches them. Four shapes warn instead of failing the load, each
+because it has a coherent operator intent: a target that matches no explicit
+route (it still resolves through `server.default_provider` like any other
+unmatched id), `capable_target` and `efficient_target` resolving to the same id
+(both tiers deliberately flattened onto one model), a `deescalate_threshold`
+below `confidence_threshold` (de-escalation made the easier direction, which a
+cost-first deployment may want), and a `[[routes]]` entry naming the router's
+own id (inert, since the router decides that id's destination). A
+`[[route_prefixes]]` entry the id merely starts with is **not** reported — it
+still serves every other id matching it. Each is emitted once per load — and a hot reload is a load, so a
+config left unfixed warns again on each one.
 
 ## `[sentry]` (optional)
 
@@ -673,4 +684,11 @@ Extra headers on every OTLP request (e.g. a hosted-collector token). Merged unde
 
 ## Routing precedence
 
-A matching `[models.upstream_model]` entry → exact `[[routes]]` match → `[[route_prefixes]]` prefix match → `server.default_provider`.
+A matching `[models.stage_router]` entry → a matching `[models.upstream_model]` entry → exact `[[routes]]` match → `[[route_prefixes]]` prefix match → `server.default_provider`.
+
+The router comes first because it is matched on the `[[models]]` entry itself: a
+request for a router-backed id is answered by the router, which picks a tier and
+resolves **that target** through the rest of the ladder — so the target, not the
+router id, is what a `[[routes]]` entry should name. An exact entry naming the
+router id is never consulted and warns at load. A `[[route_prefixes]]` entry is
+unaffected: the router takes only its own id out of that prefix's reach.
