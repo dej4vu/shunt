@@ -87,6 +87,24 @@ pub(crate) struct PendingPin {
     session: StageSession,
 }
 
+/// What one [`StageRouterStore::apply`] call decided, and what it displaced.
+pub(crate) struct StageApplied {
+    pub decision: StageDecision,
+    /// The pin this turn earned, parked until the request is admitted. `None`
+    /// for a turn that records nothing: no session id, or a read-only probe.
+    pub pin: Option<PendingPin>,
+}
+
+impl StageApplied {
+    /// A decision that records no pin, and so can displace none.
+    fn stateless(decision: StageDecision) -> Self {
+        Self {
+            decision,
+            pin: None,
+        }
+    }
+}
+
 /// Per-session tier pins. Lives on `AppState` beside the account pool, so it
 /// survives a config reload rather than being rebuilt by one.
 #[derive(Debug, Default)]
@@ -128,14 +146,14 @@ impl StageRouterStore {
         estimate: StageDecision,
         read_only: bool,
         now: Instant,
-    ) -> (StageDecision, Option<PendingPin>) {
+    ) -> StageApplied {
         // An empty header is not a session. Without this every client that
         // sends a blank `x-claude-code-session-id` would hash to one key and
         // share a single tier pin for the model — the same reason the websocket
         // pool (`adapters/responses/mod.rs`) and the inbound Codex endpoint
         // already filter it before using the id as a sticky key.
         let Some(session_id) = session_id.filter(|session_id| !session_id.is_empty()) else {
-            return (estimate, None);
+            return StageApplied::stateless(estimate);
         };
         let key = session_key(model, session_id);
         let fingerprint = fingerprint(router);
@@ -159,15 +177,17 @@ impl StageRouterStore {
         // differs also hashes to a different `fingerprint`, which this filter
         // already rejects — but only by way of the hash, which is not something
         // these two lines show on their own.
-        let pinned = entries.get(&key).copied().filter(|session| {
-            session.fingerprint == fingerprint
-                && now.saturating_duration_since(session.last_seen) <= session.ttl
-        });
+        let pinned = entries
+            .get(&key)
+            .copied()
+            .filter(|session| is_live(session, fingerprint, now));
 
         let (decision, changed) = resolve(router, pinned, estimate);
 
         if read_only {
-            return (decision, None);
+            // A probe changes nothing, so it displaced nothing: reporting a
+            // previous tier here would let `count_tokens` count as a flip.
+            return StageApplied::stateless(decision);
         }
 
         let dwell_turns = match (pinned, changed) {
@@ -178,9 +198,9 @@ impl StageRouterStore {
             // may move again.
             _ => 1,
         };
-        (
+        StageApplied {
             decision,
-            Some(PendingPin {
+            pin: Some(PendingPin {
                 key,
                 session: StageSession {
                     seq,
@@ -191,7 +211,7 @@ impl StageRouterStore {
                     ttl,
                 },
             }),
-        )
+        }
     }
 
     /// Write a pin [`StageRouterStore::apply`] prepared, once the request that
@@ -218,19 +238,38 @@ impl StageRouterStore {
     /// the next request rejects as stale. `seq` already covers the case the
     /// carve-out was for: a request decided under the new table necessarily has
     /// the higher `seq`, so it wins without needing an exemption.
-    pub(crate) fn commit(&self, pin: PendingPin, now: Instant) {
+    ///
+    /// Returns the `(from, to)` tier change this write actually made, and
+    /// `None` when it made none. That is deliberately decided *here* rather
+    /// than from the snapshot [`StageRouterStore::apply`] read: the lock is
+    /// released in between, so two concurrent turns of one session both read
+    /// `efficient`, both decide `capable`, and both would report a flip for a
+    /// session that moved once. Only one of them displaces an `efficient`
+    /// entry — the other finds `capable` already there, or is superseded — so
+    /// counting what the write did counts each move once.
+    pub(crate) fn commit(&self, pin: PendingPin, now: Instant) -> Option<(StageTier, StageTier)> {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let superseded = entries
-            .get(&pin.key)
-            .is_some_and(|current| current.seq > pin.session.seq);
+        let current = entries.get(&pin.key).copied();
+        let superseded = current.is_some_and(|current| current.seq > pin.session.seq);
         if superseded {
-            return;
+            return None;
         }
+        // Filtered by the same predicate `apply` reads pins through: an entry
+        // from another config generation, or one that has gone quiet past its
+        // TTL, is absent to the next request and so displaces nothing. Without
+        // the filter a resumed session would report a flip away from a tier no
+        // request could have been served at.
+        let previous = current
+            .filter(|current| is_live(current, pin.session.fingerprint, now))
+            .map(|current| current.tier);
         entries.insert(pin.key, pin.session);
         evict(&mut entries, now);
+        previous
+            .filter(|previous| *previous != pin.session.tier)
+            .map(|previous| (previous, pin.session.tier))
     }
 
     /// `apply` followed immediately by `commit`, the shape the store had before
@@ -246,11 +285,11 @@ impl StageRouterStore {
         read_only: bool,
         now: Instant,
     ) -> StageDecision {
-        let (decision, pin) = self.apply(model, session_id, router, estimate, read_only, now);
-        if let Some(pin) = pin {
+        let applied = self.apply(model, session_id, router, estimate, read_only, now);
+        if let Some(pin) = applied.pin {
             self.commit(pin, now);
         }
-        decision
+        applied.decision
     }
 
     #[cfg(test)]
@@ -352,6 +391,17 @@ fn evict(entries: &mut HashMap<SessionKey, StageSession>, now: Instant) {
         };
         entries.remove(&key);
     }
+}
+
+/// Whether a stored entry still speaks for the session, for the one router
+/// table identified by `fingerprint`.
+///
+/// Read by `apply` before it treats an entry as a pin and by `commit` before it
+/// treats one as displaced, because those two must agree: a pin `apply` ignored
+/// as stale must not surface as the `from` side of a flip.
+fn is_live(session: &StageSession, fingerprint: u64, now: Instant) -> bool {
+    session.fingerprint == fingerprint
+        && now.saturating_duration_since(session.last_seen) <= session.ttl
 }
 
 fn session_key(model: &str, session_id: &str) -> SessionKey {

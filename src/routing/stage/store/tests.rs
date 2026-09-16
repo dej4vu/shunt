@@ -34,6 +34,18 @@
 //! from its own estimate, so the probe has to be one a surviving pin would
 //! *change* — a capable pin holding back an efficient probe — or the two
 //! outcomes are indistinguishable and the test passes either way.
+//!
+//! The four flip tests pin what `commit` reports, which is the flip counter's
+//! only input. Return `None` unconditionally and
+//! `a_committed_escalation_is_reported_as_a_flip` goes red (with
+//! `two_concurrent_turns_that_agree_report_one_flip` alongside it, so a `commit`
+//! that stopped reporting entirely cannot satisfy either). The other three pin
+//! the narrowing clauses, one apiece: drop the `previous != tier` filter and
+//! `two_concurrent_turns_that_agree_report_one_flip` goes red with
+//! `Some((Capable, Capable))`; report from the superseded path instead of
+//! returning early and `a_superseded_commit_reports_no_flip` goes red; drop the
+//! `is_live` filter on the entry being replaced and
+//! `a_pin_that_expired_is_not_flipped_away_from` goes red.
 
 use super::*;
 use crate::config::StageRouterPicker;
@@ -504,7 +516,11 @@ fn a_decided_turn_records_nothing_until_it_is_committed() {
     let router = router();
     let now = Instant::now();
 
-    let (decided, pin) = store.apply("claude-auto", Some(SESSION), &router, capable(), false, now);
+    let StageApplied {
+        decision: decided,
+        pin,
+        ..
+    } = store.apply("claude-auto", Some(SESSION), &router, capable(), false, now);
     assert_eq!(decided.tier, StageTier::Capable);
     assert_eq!(store.len(), 0, "apply alone must not write");
 
@@ -538,13 +554,16 @@ fn a_read_only_or_sessionless_turn_earns_no_pin() {
     let router = router();
     let now = Instant::now();
 
-    let (_, probe) = store.apply("claude-auto", Some(SESSION), &router, capable(), true, now);
+    let StageApplied { pin: probe, .. } =
+        store.apply("claude-auto", Some(SESSION), &router, capable(), true, now);
     assert!(probe.is_none(), "a count_tokens probe earns no pin");
 
-    let (_, stateless) = store.apply("claude-auto", None, &router, capable(), false, now);
+    let StageApplied { pin: stateless, .. } =
+        store.apply("claude-auto", None, &router, capable(), false, now);
     assert!(stateless.is_none(), "a sessionless turn earns no pin");
 
-    let (_, blank) = store.apply("claude-auto", Some(""), &router, capable(), false, now);
+    let StageApplied { pin: blank, .. } =
+        store.apply("claude-auto", Some(""), &router, capable(), false, now);
     assert!(blank.is_none(), "a blank session header earns no pin");
 
     assert_eq!(store.len(), 0);
@@ -561,7 +580,7 @@ fn a_late_commit_does_not_overwrite_a_newer_decision() {
     let start = Instant::now();
 
     // Both read an empty store, so both are first-turn decisions.
-    let (_, older) = store.apply(
+    let StageApplied { pin: older, .. } = store.apply(
         "claude-auto",
         Some(SESSION),
         &router,
@@ -569,7 +588,7 @@ fn a_late_commit_does_not_overwrite_a_newer_decision() {
         false,
         start,
     );
-    let (_, newer) = store.apply(
+    let StageApplied { pin: newer, .. } = store.apply(
         "claude-auto",
         Some(SESSION),
         &router,
@@ -610,7 +629,7 @@ fn an_in_order_commit_still_replaces_the_pin() {
     let router = router();
     let start = Instant::now();
 
-    let (_, first) = store.apply(
+    let StageApplied { pin: first, .. } = store.apply(
         "claude-auto",
         Some(SESSION),
         &router,
@@ -620,7 +639,7 @@ fn an_in_order_commit_still_replaces_the_pin() {
     );
     store.commit(first.expect("the first turn earns a pin"), start);
 
-    let (_, second) = store.apply(
+    let StageApplied { pin: second, .. } = store.apply(
         "claude-auto",
         Some(SESSION),
         &router,
@@ -669,7 +688,7 @@ fn a_pre_reload_commit_does_not_overwrite_a_post_reload_pin() {
     // A surviving *capable* post-reload pin holds an efficient probe back; a
     // pre-reload pin that overwrote it is rejected on fingerprint, leaving the
     // probe unpinned and free to answer from its own estimate.
-    let (_, stale) = store.apply(
+    let StageApplied { pin: stale, .. } = store.apply(
         "claude-auto",
         Some(SESSION),
         &before,
@@ -677,7 +696,7 @@ fn a_pre_reload_commit_does_not_overwrite_a_post_reload_pin() {
         false,
         start,
     );
-    let (_, fresh) = store.apply(
+    let StageApplied { pin: fresh, .. } = store.apply(
         "claude-auto",
         Some(SESSION),
         &after,
@@ -723,7 +742,7 @@ fn a_post_reload_decision_still_replaces_an_old_table_pin() {
         false,
         start,
     );
-    let (_, fresh) = store.apply(
+    let StageApplied { pin: fresh, .. } = store.apply(
         "claude-auto",
         Some(SESSION),
         &after,
@@ -804,4 +823,163 @@ fn a_real_scorer_decision_is_evidence_that_moves_a_pin() {
     );
     assert_eq!(decided.tier, StageTier::Capable);
     assert_eq!(decided.source, estimate.source);
+}
+
+/// The flip counter's input: `commit` reports the tier change its own write
+/// made, so what is counted is what the session actually did.
+#[test]
+fn a_committed_escalation_is_reported_as_a_flip() {
+    let store = StageRouterStore::new();
+    let router = router();
+    let start = Instant::now();
+
+    store.apply_now(
+        "claude-auto",
+        Some(SESSION),
+        &router,
+        efficient(0.9),
+        false,
+        start,
+    );
+
+    let StageApplied { pin, .. } = store.apply(
+        "claude-auto",
+        Some(SESSION),
+        &router,
+        capable(),
+        false,
+        start + Duration::from_secs(1),
+    );
+    let flip = store.commit(
+        pin.expect("the escalating turn earns a pin"),
+        start + Duration::from_secs(1),
+    );
+
+    assert_eq!(flip, Some((StageTier::Efficient, StageTier::Capable)));
+}
+
+/// Why the flip is decided at the write and not from the tier the deciding
+/// request read: the store lock is released in between, so two turns of one
+/// session both see `efficient`, both choose `capable`, and a flip derived from
+/// that shared snapshot would be counted twice for a session that moved once.
+///
+/// Non-vacuity: report the pre-decision tier instead — `apply` handing back the
+/// `pinned` tier and `commit` returning it unconditionally — and the second
+/// assertion goes red with `Some((Efficient, Capable))`.
+#[test]
+fn two_concurrent_turns_that_agree_report_one_flip() {
+    let store = StageRouterStore::new();
+    let router = router();
+    let start = Instant::now();
+
+    store.apply_now(
+        "claude-auto",
+        Some(SESSION),
+        &router,
+        efficient(0.9),
+        false,
+        start,
+    );
+
+    // Both decide against the same `efficient` pin: neither has committed yet.
+    let StageApplied { pin: first, .. } = store.apply(
+        "claude-auto",
+        Some(SESSION),
+        &router,
+        capable(),
+        false,
+        start + Duration::from_secs(1),
+    );
+    let StageApplied { pin: second, .. } = store.apply(
+        "claude-auto",
+        Some(SESSION),
+        &router,
+        capable(),
+        false,
+        start + Duration::from_secs(2),
+    );
+
+    let first = store.commit(
+        first.expect("the first turn earns a pin"),
+        start + Duration::from_secs(2),
+    );
+    let second = store.commit(
+        second.expect("the second turn earns a pin"),
+        start + Duration::from_secs(2),
+    );
+
+    assert_eq!(
+        first,
+        Some((StageTier::Efficient, StageTier::Capable)),
+        "the turn that displaced the efficient pin moved the session"
+    );
+    assert_eq!(
+        second, None,
+        "the second turn found capable already pinned, so it moved nothing"
+    );
+}
+
+/// A write the `seq` guard drops changed nothing, so it flipped nothing — even
+/// though the tier it carries differs from the tier now stored.
+#[test]
+fn a_superseded_commit_reports_no_flip() {
+    let store = StageRouterStore::new();
+    let router = router();
+    let start = Instant::now();
+
+    let StageApplied { pin: older, .. } = store.apply(
+        "claude-auto",
+        Some(SESSION),
+        &router,
+        capable(),
+        false,
+        start,
+    );
+    let StageApplied { pin: newer, .. } = store.apply(
+        "claude-auto",
+        Some(SESSION),
+        &router,
+        efficient(0.9),
+        false,
+        start + Duration::from_secs(1),
+    );
+
+    store.commit(newer.expect("the newer turn earns a pin"), start);
+    let flip = store.commit(older.expect("the older turn earns a pin"), start);
+
+    assert_eq!(flip, None);
+}
+
+/// `commit` reads the entry it replaces through the same liveness filter
+/// `apply` reads pins through. Without that, resuming a session after its TTL
+/// lapsed would report a flip away from a tier no request was served at — the
+/// entry was already invisible to the turn that decided.
+#[test]
+fn a_pin_that_expired_is_not_flipped_away_from() {
+    let store = StageRouterStore::new();
+    let router = router();
+    let start = Instant::now();
+
+    store.apply_now(
+        "claude-auto",
+        Some(SESSION),
+        &router,
+        efficient(0.9),
+        false,
+        start,
+    );
+
+    // Past the table's `session_ttl_seconds`, so the entry is stale to `apply`.
+    let resumed = start + Duration::from_secs(router.session_ttl_seconds + 1);
+    let StageApplied { pin, .. } = store.apply(
+        "claude-auto",
+        Some(SESSION),
+        &router,
+        capable(),
+        false,
+        resumed,
+    );
+    let flip = store.commit(pin.expect("the resumed turn earns a pin"), resumed);
+
+    assert_eq!(flip, None);
 }
