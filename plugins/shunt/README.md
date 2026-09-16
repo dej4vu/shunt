@@ -20,7 +20,7 @@ shunt: pool — degraded   http://127.0.0.1:3001
   headroom left, averaged over the pool's accounts; a shared figure, not a promise about your next request
 ```
 
-The mod reads the gateway's [`GET /usage`](https://shunt.dev/reference/endpoints/)
+The mod reads the gateway's [`GET /usage`](https://shunt.sh/reference/endpoints/)
 endpoint and prints it. It answers the command itself — the hook returns without
 calling `next`, so nothing is sent to the model and the answer costs no tokens.
 
