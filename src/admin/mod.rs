@@ -2048,6 +2048,7 @@ mod tests {
                 api_key_header: Default::default(),
                 effort: None,
                 service_tier: None,
+                classifier_model: None,
                 count_tokens: Default::default(),
                 accounts,
                 account_scope,
