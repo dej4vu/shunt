@@ -949,7 +949,7 @@ pub(super) async fn forward_chatgpt_oauth(
                 ForwardOptions {
                     upstream_body: upstream_body.clone(),
                     auth,
-                    turn,
+                    turn: turn.clone(),
                     codex_quota_account: Some(account.clone()),
                     // Each account attempt gets its own cheap Arc clone;
                     // forward_websocket spawns its own blocking encode from it,
@@ -1195,7 +1195,7 @@ async fn relay_success(
             keepalive,
         ))
     } else {
-        json_response(upstream, relay).await
+        json_response(upstream, relay, input_tokens_estimate).await
     }
 }
 
@@ -1204,10 +1204,11 @@ async fn relay_success(
 /// out because the pool loop has two success arms (first attempt and
 /// refresh retry) that must consume the same handle without awaiting it
 /// twice — `JoinHandle` is not `Clone`, so `.take()` leaves a torn-down `None`
-/// behind for whichever arm does not run. Non-streaming turns never seed
-/// `message_start`, so `estimate_handle` is always `None` here already
-/// (`forward`'s gate only produces `estimate_input`, and thus a spawned
-/// handle, for streaming turns), which naturally yields `0` below.
+/// behind for whichever arm does not run. A non-streaming turn seeds no
+/// `message_start`, so `forward`'s gate spawns a handle for one only when it
+/// carries `stop_sequences` — there the estimate is what keeps a stopped turn's
+/// final JSON from reporting `input_tokens: 0` (issue #605). Without either, the
+/// handle is `None` and this naturally yields `0` below.
 async fn take_estimate(estimate_handle: &mut Option<tokio::task::JoinHandle<u64>>) -> u64 {
     match estimate_handle.take() {
         // Bounded like `forward_http`: the committed `message_start` must not
@@ -1577,6 +1578,7 @@ mod tests {
                 client_wants_stream: stream,
                 thinking_enabled: false,
                 tool_search_native: false,
+                stop_sequences: Vec::new(),
             },
             estimate_input: None,
         }
