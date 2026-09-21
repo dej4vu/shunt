@@ -429,7 +429,7 @@ fall-through to the stage router. `prefill_router` is a **known** type whose
 availability is decided at compile time: it parses in every build, and on a
 build without the `prefill-router` cargo feature — which is every release
 binary — the load error names that feature, ahead of any key-level complaint
-about the table ([`routing-algorithms.md`](routing-algorithms.md) §4).
+about the table ([`routing-algorithms.md`](routing-algorithms.md) §5).
 
 The router-targeting-a-router check compares the target **after**
 `strip_context_window_hint`, because that is what `resolve_chain` matches on. It
@@ -494,9 +494,11 @@ chosen tier routes to, and `x-gateway-route-source` is
 one: `random` reports `random` for a fresh draw and `random_session` for a
 hash-pinned arm, `noop` reports `noop`, and `auto` reports the stage router's
 own labels because it *is* the stage router under a preset. A held turn reports
-`capable_hold` (§4). Both are omitted for an id that carries no router —
-sent empty, a client could not tell "routed to the efficient tier" from "not
-router-routed". They sit beside the existing `x-gateway-upstream` /
+`capable_hold` (§4). A turn the `[models.subagents]` overlay diverted reports
+`subagent_type` for a `by_type` hit and `subagent` for the `target` fallback
+(`routing-algorithms.md` §4). Both are omitted only when neither a router nor an
+overlay decided the turn — sent empty, a client could not tell "routed to the
+efficient tier" from "not routed at all". They sit beside the existing `x-gateway-upstream` /
 `x-gateway-model` / `x-gateway-upstream-model` trio; `x-gateway-routed-model`
 differs from `x-gateway-upstream-model` whenever the target maps its own
 `upstream_model`.
