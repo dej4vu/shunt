@@ -67,6 +67,11 @@ impl Adapter for ResponsesAdapter {
         _uri: &'a Uri,
         headers: &'a HeaderMap,
         body: RequestBody,
+        // Honoured only on the non-streaming path, which is the one that
+        // buffers a whole upstream reply — and the one every internal call
+        // takes, since `routing::serve` forces `stream` off. A streaming turn
+        // relays instead of buffering, so its bound falls to that collector.
+        response_byte_cap: Option<usize>,
     ) -> AdapterFuture<'a> {
         // The session id keys the websocket connection pool (issue #32) so turns
         // of one Claude Code conversation reuse a live connection. Keep an owned
@@ -85,7 +90,15 @@ impl Adapter for ResponsesAdapter {
                 )
         });
         Box::pin(async move {
-            forward(state, route, pool_key, session_id.map(str::to_string), body).await
+            forward(
+                state,
+                route,
+                pool_key,
+                session_id.map(str::to_string),
+                body,
+                response_byte_cap,
+            )
+            .await
         })
     }
 }
@@ -96,6 +109,7 @@ async fn forward(
     pool_key: Option<String>,
     session_id: Option<String>,
     body: RequestBody,
+    response_byte_cap: Option<usize>,
 ) -> Result<(StatusCode, axum::response::Response), AdapterError> {
     let request_json = body.json();
     // The effective conversation id: the inbound session header when present,
@@ -189,6 +203,7 @@ async fn forward(
         thinking_enabled,
         tool_search_native,
         stop_sequences,
+        response_byte_cap,
     };
     let upstream_body = Arc::new(translate_request_value(
         request_json,
@@ -453,6 +468,9 @@ pub(crate) async fn chain_attempt(
         thinking_enabled,
         tool_search_native,
         stop_sequences,
+        // This path is streaming by construction, so nothing here buffers a
+        // whole reply for the cap to bound.
+        response_byte_cap: None,
     };
     let upstream_body = Arc::new(translate_request_value(
         request_json,
