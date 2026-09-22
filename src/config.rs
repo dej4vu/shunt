@@ -2437,7 +2437,7 @@ pub enum ConfigError {
     AntigravityLegacyTableMissingAuth,
     #[error("{0}")]
     AntigravityMigrationRequired(String),
-    #[error("providers.{provider}.accounts requires auth = \"claude_oauth\", \"chatgpt_oauth\", or \"kimi_oauth\"")]
+    #[error("providers.{provider}.accounts requires auth = \"claude_oauth\", \"chatgpt_oauth\", \"kimi_oauth\", or \"antigravity_oauth\"")]
     AccountsRequireOauthProvider { provider: String },
     #[error("providers.{provider}.classifier_model requires kind = \"anthropic\"; it remaps Claude Code's auto-mode classifier request within the provider, and only the anthropic adapter carries that request shape")]
     ClassifierModelWrongKind { provider: String },
@@ -2467,6 +2467,8 @@ pub enum ConfigError {
     InvalidAccountName { provider: String, name: String },
     #[error("providers.{provider}.accounts account \"{name}\" sets both credentials and token_env; set at most one credential source")]
     AccountMultipleCredentialSources { provider: String, name: String },
+    #[error("providers.{provider}.accounts account \"{name}\" sets token_env, but Antigravity accounts require a credential file containing a project id; use `credentials`, or omit the account entirely to use the default account store")]
+    AntigravityAccountTokenEnv { provider: String, name: String },
     #[error("server.pool.{key} must be between 0.0 and 1.0, got {value}")]
     InvalidPoolThreshold { key: &'static str, value: f64 },
     #[error("[server.status].sources[{index}].provider must not be empty")]
@@ -2797,6 +2799,59 @@ pub enum ConfigError {
 }
 
 impl ProviderConfig {
+    pub fn store_family(&self) -> Option<crate::accounts::StoreFamily> {
+        use crate::accounts::StoreFamily;
+
+        match self.auth {
+            AuthMode::ClaudeOauth => Some(StoreFamily::Claude),
+            AuthMode::ChatgptOauth => Some(StoreFamily::Chatgpt),
+            AuthMode::KimiOauth => Some(StoreFamily::Kimi),
+            AuthMode::AntigravityOauth => Some(StoreFamily::Antigravity),
+            _ => None,
+        }
+    }
+
+    pub async fn resolve_pool_accounts(&self) -> Result<Vec<AccountConfig>, String> {
+        use crate::auth::{antigravity, claude, codex, kimi};
+
+        let Some(family) = self.store_family() else {
+            return Ok(Vec::new());
+        };
+        let (label, dir, scan): (_, _, fn() -> std::io::Result<Vec<AccountConfig>>) =
+            match self.auth {
+                AuthMode::ClaudeOauth => (
+                    "Claude",
+                    claude::store::default_accounts_dir(),
+                    claude::store::scan_accounts,
+                ),
+                AuthMode::ChatgptOauth => (
+                    "codex",
+                    codex::store::default_accounts_dir(),
+                    codex::store::scan_accounts,
+                ),
+                AuthMode::KimiOauth => (
+                    "Kimi",
+                    kimi::store::default_accounts_dir(),
+                    kimi::store::scan_accounts,
+                ),
+                AuthMode::AntigravityOauth => (
+                    "Antigravity",
+                    antigravity::store::default_accounts_dir(),
+                    antigravity::store::scan_accounts,
+                ),
+                _ => unreachable!(),
+            };
+        crate::auth::shared::resolve_pool_accounts(
+            label,
+            &self.accounts,
+            &self.account_scope,
+            family,
+            dir,
+            scan,
+        )
+        .await
+    }
+
     fn anthropic(base_url: &str) -> Self {
         Self {
             kind: ProviderKind::Anthropic,
@@ -3932,10 +3987,13 @@ impl Config {
                     }
                 }
             }
-            if !provider.accounts.is_empty()
+            if (!provider.accounts.is_empty() || !provider.account_scope.is_empty())
                 && !matches!(
                     provider.auth,
-                    AuthMode::ClaudeOauth | AuthMode::ChatgptOauth | AuthMode::KimiOauth
+                    AuthMode::ClaudeOauth
+                        | AuthMode::ChatgptOauth
+                        | AuthMode::KimiOauth
+                        | AuthMode::AntigravityOauth
                 )
             {
                 return Err(ConfigError::AccountsRequireOauthProvider {
@@ -4077,25 +4135,47 @@ impl Config {
                 }
             }
             let mut account_names = HashSet::new();
-            for account in &provider.accounts {
-                if account.name.is_empty()
-                    || !account.name.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    })
-                {
+            // Bare `accounts = ["..."]` entries are matched by exact name
+            // against the scanned store, and the scan (`account_files`) skips
+            // every file whose stem fails `validate_account_name`. A scope
+            // entry that fails it therefore can never match on any pool: it
+            // would pass `shunt check`, then fail the first routed request
+            // with "account scope references missing store account". Reject
+            // it here, where the operator sees it.
+            for account_name in provider
+                .account_scope
+                .iter()
+                .chain(provider.accounts.iter().map(|account| &account.name))
+            {
+                if crate::auth::shared::validate_account_name(account_name).is_err() {
                     return Err(ConfigError::InvalidAccountName {
                         provider: name.clone(),
-                        name: account.name.clone(),
+                        name: account_name.clone(),
                     });
                 }
-                if !account_names.insert(&account.name) {
+                if !account_names.insert(account_name) {
                     return Err(ConfigError::DuplicateAccountName {
+                        provider: name.clone(),
+                        name: account_name.clone(),
+                    });
+                }
+            }
+            for account in &provider.accounts {
+                if account.credentials.is_some() && account.token_env.is_some() {
+                    return Err(ConfigError::AccountMultipleCredentialSources {
                         provider: name.clone(),
                         name: account.name.clone(),
                     });
                 }
-                if account.credentials.is_some() && account.token_env.is_some() {
-                    return Err(ConfigError::AccountMultipleCredentialSources {
+                // `resolve_antigravity_account` (`src/auth/mod.rs`) always
+                // rejects a `token_env` Antigravity account at request time —
+                // a bearer alone carries no Code Assist project id — so a
+                // config admitting one here would only fail later, as a
+                // per-request 503 instead of a boot-time error. Kimi
+                // legitimately supports `token_env`, so this is scoped to
+                // Antigravity only.
+                if provider.auth == AuthMode::AntigravityOauth && account.token_env.is_some() {
+                    return Err(ConfigError::AntigravityAccountTokenEnv {
                         provider: name.clone(),
                         name: account.name.clone(),
                     });
@@ -5761,6 +5841,58 @@ mod tests {
         config
     }
 
+    #[tokio::test]
+    async fn antigravity_provider_resolves_named_pool_and_preserves_singleton() {
+        use crate::accounts::StoreFamily;
+        use crate::auth::{antigravity::store, shared::EnvVarGuard};
+
+        let _guard = store::TEST_ENV_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("shunt-config-agy-{}", uuid::Uuid::new_v4()));
+        let _env = EnvVarGuard::set("SHUNT_ANTIGRAVITY_ACCOUNTS_DIR", &dir);
+        let mut provider = Config::default().providers.remove("antigravity").unwrap();
+        assert_eq!(provider.auth, AuthMode::AntigravityOauth);
+        assert_eq!(provider.store_family(), Some(StoreFamily::Antigravity));
+        assert!(provider.resolve_pool_accounts().await.unwrap().is_empty());
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(provider.resolve_pool_accounts().await.unwrap().is_empty());
+        std::fs::write(store::account_path("primary"), "{}").unwrap();
+        std::fs::write(store::account_path("backup"), "{}").unwrap();
+        let accounts = provider.resolve_pool_accounts().await.unwrap();
+        assert_eq!(
+            accounts.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            ["backup", "primary"]
+        );
+        assert!(accounts.iter().all(|a| a.store_entry
+            && a.store_family == Some(StoreFamily::Antigravity)
+            && a.uuid.is_none()));
+        provider.account_scope = vec!["primary".into()];
+        provider.accounts = vec![AccountConfig {
+            name: "inline".into(),
+            credentials: Some(dir.join("inline.json").to_string_lossy().into_owned()),
+            priority: 2,
+            disabled: true,
+            ..Default::default()
+        }];
+        let accounts = provider.resolve_pool_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].name, "primary");
+        assert!(accounts[0].store_entry);
+        assert_eq!(accounts[1].name, "inline");
+        assert!(!accounts[1].store_entry);
+        assert_eq!(accounts[1].store_family, Some(StoreFamily::Antigravity));
+        assert_eq!(accounts[1].priority, 2);
+        assert!(accounts[1].disabled);
+        provider.account_scope.clear();
+        assert_eq!(provider.resolve_pool_accounts().await.unwrap().len(), 1);
+        provider.account_scope = vec!["missing".into()];
+        assert!(provider
+            .resolve_pool_accounts()
+            .await
+            .unwrap_err()
+            .contains("missing store account"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn accounts_require_oauth_provider() {
         let mut config = Config::default();
@@ -5902,6 +6034,31 @@ mod tests {
             config.validate().unwrap_err(),
             ConfigError::AccountMultipleCredentialSources { .. }
         ));
+    }
+
+    #[test]
+    fn antigravity_oauth_rejects_token_env_accounts() {
+        // A bearer alone carries no Code Assist project id
+        // (`resolve_antigravity_account` in `src/auth/mod.rs` always rejects
+        // this at request time), so it must fail at boot rather than as a
+        // per-request 503. Exact config from the PR review that triggered
+        // this: `accounts = [{ name = "primary", token_env = "AGY_TOKEN" }]`.
+        let mut config = Config::default();
+        let mut configured = account("primary");
+        configured.token_env = Some("AGY_TOKEN".to_string());
+        config.providers.get_mut("antigravity").unwrap().accounts = vec![configured];
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::AntigravityAccountTokenEnv { .. }
+        ));
+
+        // Kimi legitimately supports token_env; the rejection must not spill
+        // over onto it.
+        let mut config = kimi_oauth_config();
+        let mut configured = account("primary");
+        configured.token_env = Some("KIMI_TOKEN".to_string());
+        config.providers.get_mut("kimi").unwrap().accounts = vec![configured];
+        config.validate().unwrap();
     }
 
     #[test]
