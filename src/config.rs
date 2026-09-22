@@ -27,17 +27,21 @@ pub use http_tuning::{
 };
 pub use presets::{provider_presets, ProviderPresetView};
 pub use router::{
-    AutoRouterConfig, CallBounds, HandoffNotesConfig, PrefillRouterConfig, RandomAffinity,
-    RandomRouterConfig, RouterConfig, StageClassifierConfig, StageRouterConfig, StageRouterPicker,
-    ToolSemanticsConfig, DEFAULT_BASE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD,
+    AutoRouterConfig, CallBounds, CapabilityClassifierConfig, ClassifierPolicy, ClassifyTrigger,
+    CompositeClassifierConfig, CompositeRouterConfig, CompositeStageConfig, CompositeTrigger,
+    CustomClassifierConfig, HandoffNotesConfig, LlmClassifierConfig, PrefillRouterConfig,
+    RandomAffinity, RandomRouterConfig, RouterConfig, StageClassifierConfig, StageRouterConfig,
+    StageRouterPicker, ToolSemanticsConfig, DEFAULT_BASE_THRESHOLD, DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_DEESCALATE_THRESHOLD, DEFAULT_GATED_IDLE_MS, DEFAULT_GATED_MAX_BYTES,
     DEFAULT_GATED_MAX_DURATION_MS, DEFAULT_JUDGE_MAX_RESPONSE_BYTES, DEFAULT_JUDGE_TIMEOUT_MS,
-    DEFAULT_MAX_JUDGE_CALLS,
+    DEFAULT_MAX_JUDGE_CALLS, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 pub use secrets::Secret;
 pub use session::GatewaySessionConfig;
 pub use spend::{GroupLimitMode, SpendConfig, SpendEnforcementConfig};
-pub use subagents::{PassthroughSubagentsConfig, SubagentsConfig};
+pub use subagents::{
+    PassthroughSubagentsConfig, SubagentsClassifierConfig, SubagentsConfig, SubagentsCustomConfig,
+};
 pub use upstreams::{AccountSelection, AuthMap, UpstreamAuth, UpstreamConfig};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2537,7 +2541,7 @@ pub enum ConfigError {
     #[error("models entry {model} has both a router and an upstream_model map; a router picks its own target, so the two are mutually exclusive")]
     RouterWithUpstreamMap { model: String },
     #[error("models entry {model} router {key} must not be empty")]
-    EmptyRouterTarget { model: String, key: &'static str },
+    EmptyRouterTarget { model: String, key: String },
     #[error("models entry {model} router targets {target}, which carries its own [models.router] or [models.subagents] table; a router target must be a concrete model")]
     RouterRecursion { model: String, target: String },
     #[error("models entry {model} subagents {key} must not be empty")]
@@ -2574,12 +2578,41 @@ pub enum ConfigError {
     InvalidStageRouterWindow { model: String },
     #[error("model \"{model}\": [models.router] {key} must be at least 1")]
     ZeroCallBound { model: String, key: &'static str },
-    #[error("model \"{model}\": [models.router.classifier] target \"{target}\" resolves to passthrough upstream \"{provider}\"; a judge runs only on a credential the gateway injects")]
+    #[error("model \"{model}\": judge target {key} = \"{target}\" resolves to passthrough upstream \"{provider}\"; a judge runs only on a credential the gateway injects")]
     PassthroughJudgeTarget {
         model: String,
+        key: String,
         target: String,
         provider: String,
     },
+    #[error("models entry {model} router threshold_step is {value}; it must be finite, at least 0.0, and leave base_threshold + 2 * threshold_step at most 1.0")]
+    InvalidThresholdStep { model: String, value: f64 },
+    #[error("models entry {model} classifier recent_turn_window must be at least 1; omit the key for the narrow judge that sees the opening task and the latest follow-up")]
+    InvalidClassifierWindow { model: String },
+    #[error("models entry {model} classifier max_output_tokens must be at least 1")]
+    ZeroMaxOutputTokens { model: String },
+    #[error("models entry {model} classifier models.{group} is missing or empty; a custom classifier needs both `any` (the runtime model list) and `judge` (what it consults)")]
+    MissingClassifierGroup { model: String, group: &'static str },
+    #[error("models entry {model} classifier models.{group} lists {target}, which is not in models.any; every answer group's members must be runtime models (models.judge is exempt: it is consulted, never served)")]
+    ClassifierTargetNotInAny {
+        model: String,
+        group: String,
+        target: String,
+    },
+    #[error("models entry {model} classifier default_target {group:?} must name a configured, non-empty model group other than `judge`")]
+    InvalidClassifierDefaultTarget { model: String, group: String },
+    #[error("models entry {model} classifier response_schema must be a JSON object: {message}")]
+    InvalidResponseSchema { model: String, message: String },
+    #[error("models entry {model} classifier prompt {reason}")]
+    InvalidClassifierPrompt { model: String, reason: &'static str },
+    #[error("models entry {model} classifier message_hash_fallback = true requires classify_trigger = \"new_session\"; any other trigger re-decides before the hash could hold an assignment")]
+    MessageHashFallbackTrigger { model: String },
+    #[error("models entry {model} subagents classify_trigger = \"user_turn\" is not supported for sub-agent routing; a delegated agent is classified per (session, agent), not per user turn")]
+    SubagentsClassifierTrigger { model: String },
+    #[error("models entry {model} subagents message_hash_fallback must be false; the overlay keys on (session, agent), and hashing the first user message would merge two agents with the same opening prompt")]
+    SubagentsMessageHashFallback { model: String },
+    #[error("models entry {model} driven router could not be constructed: {message}")]
+    DrivenRouterBuild { model: String, message: String },
     #[error("models entry {model} random router targets must not be empty")]
     EmptyRandomTargets { model: String },
     #[error("models entry {model} random router has {weights} weights but {targets} targets; weights follow target order, one per target")]
@@ -4523,7 +4556,7 @@ impl Config {
             if target.trim().is_empty() {
                 return Err(ConfigError::EmptyRouterTarget {
                     model: model_id.to_string(),
-                    key,
+                    key: key.into_owned(),
                 });
             }
             // `resolve_model_chain` strips the context-window hint before it
@@ -4558,6 +4591,24 @@ impl Config {
         if let RouterConfig::PrefillRouter(prefill) = router {
             validate_prefill_router(model_id, prefill)?;
         }
+        match router {
+            RouterConfig::LlmClassifier(classifier) => {
+                self.validate_llm_classifier(model_id, classifier)?
+            }
+            RouterConfig::Composite(composite) => self.validate_composite(model_id, composite)?,
+            _ => {}
+        }
+        // Last, and only after every key-level verdict: upstream's own
+        // constructor is the authority on a rule shunt does not spell, and its
+        // message names libsy's field rather than the operator's key — so it
+        // must not be what an operator sees for a mistake shunt can describe
+        // itself.
+        crate::routing::driven::check_buildable(router).map_err(|message| {
+            ConfigError::DrivenRouterBuild {
+                model: model_id.to_string(),
+                message,
+            }
+        })?;
         Ok(())
     }
 
@@ -4599,11 +4650,18 @@ impl Config {
                 });
             }
         }
-        for (key, target) in subagents.named_targets() {
+        // Judges chained after targets, exactly as `validate_router` chains
+        // them: the one-hop rule is about what the resolver would do with an
+        // id, and it would do the same thing with a judge id.
+        for (key, target) in subagents
+            .named_targets()
+            .into_iter()
+            .chain(subagents.named_judges())
+        {
             if target.trim().is_empty() {
                 return Err(ConfigError::EmptySubagentsTarget {
                     model: model_id.to_string(),
-                    key,
+                    key: key.into_owned(),
                 });
             }
             let resolved = crate::routing::strip_context_window_hint(target);
@@ -4614,10 +4672,13 @@ impl Config {
             {
                 return Err(ConfigError::SubagentsRecursion {
                     model: model_id.to_string(),
-                    key,
+                    key: key.into_owned(),
                     target: target.to_string(),
                 });
             }
+        }
+        if let Some(classifier) = subagents.classifier() {
+            self.validate_subagents_classifier(model_id, classifier)?;
         }
         Ok(())
     }
@@ -4655,7 +4716,7 @@ impl Config {
         // skipped check is one a later preset change could quietly outgrow.
         CallBounds::validate(model_id, router.bound_keys())?;
         if let Some(classifier) = &router.classifier {
-            self.validate_judge_is_injecting(model_id, &classifier.target)?;
+            self.validate_judge_is_injecting(model_id, "classifier.target", &classifier.target)?;
         }
         if router.recent_turn_window == 0 {
             return Err(ConfigError::InvalidStageRouterWindow {
@@ -4700,11 +4761,17 @@ impl Config {
     /// Called from `validate_stage_router`, which runs after
     /// `normalize_upstreams` has materialised `self.providers` — the map
     /// `route_is_passthrough` reads.
-    fn validate_judge_is_injecting(&self, model_id: &str, target: &str) -> Result<(), ConfigError> {
+    pub(crate) fn validate_judge_is_injecting(
+        &self,
+        model_id: &str,
+        key: &str,
+        target: &str,
+    ) -> Result<(), ConfigError> {
         for route in crate::routing::resolve_model_chain(self, target) {
             if self.route_is_passthrough(&route) {
                 return Err(ConfigError::PassthroughJudgeTarget {
                     model: model_id.to_string(),
+                    key: key.to_string(),
                     target: target.to_string(),
                     provider: route.provider,
                 });
@@ -4796,9 +4863,14 @@ impl Config {
                 .iter()
                 .flat_map(|router| router.targets().into_iter().chain(router.judges()))
                 .chain(model.subagents.iter().flat_map(|subagents| {
+                    // Targets *and* judges: a classifier-form overlay consults
+                    // its own judge on the gateway's credential, so a judge id
+                    // that silently lands on the default provider is the same
+                    // misconfiguration as a target that does.
                     subagents
                         .named_targets()
                         .into_iter()
+                        .chain(subagents.named_judges())
                         .map(|(_, target)| target)
                 }));
             for target in targets {
@@ -8626,6 +8698,42 @@ efficient_target = "claude-sonnet-4-6"
         }
     }
 
+    /// A driven `llm_classifier` entry whose *strong* tier is `target`, for the
+    /// one-hop cases. Built from TOML rather than a struct literal so the test
+    /// exercises the wire shape an operator writes.
+    fn classifier_model(id: &str, target: &str) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            display_name: None,
+            upstream_model: None,
+            router: Some(
+                toml::from_str(&format!(
+                    "type = \"llm_classifier\"\nmode = \"capability\"\nclassifier_target = \"judge-alias\"\nstrong_target = \"{target}\"\nweak_target = \"claude-sonnet-4-6\"\nbase_threshold = 0.5"
+                ))
+                .expect("the classifier table parses"),
+            ),
+            stage_router: None,
+            subagents: None,
+        }
+    }
+
+    /// A `composite` entry whose capable tier is `target`.
+    fn composite_model(id: &str, target: &str) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            display_name: None,
+            upstream_model: None,
+            router: Some(
+                toml::from_str(&format!(
+                    "type = \"composite\"\n[classifier]\ntarget = \"judge-alias\"\nbase_threshold = 0.5\nclassify_trigger = \"user_turn\"\n[stage]\ncapable_target = \"{target}\"\nefficient_target = \"claude-sonnet-4-6\"\nconfidence_threshold = 0.5"
+                ))
+                .expect("the composite table parses"),
+            ),
+            stage_router: None,
+            subagents: None,
+        }
+    }
+
     /// The one-hop rule ranges over every router type, in both directions, and
     /// normalizes the `[1m]` hint exactly as `resolve_chain` does. A predicate
     /// that compared raw ids would leave `"<a router>[1m]"` satisfying the rule
@@ -8659,6 +8767,20 @@ efficient_target = "claude-sonnet-4-6"
                 vec![
                     router_model("claude-auto", "claude-canary[1M]", "claude-sonnet-4-6"),
                     random_model("claude-canary", &["claude-opus-4-8"]),
+                ],
+            ),
+            (
+                "llm_classifier -> stage",
+                vec![
+                    classifier_model("claude-classified", "claude-auto"),
+                    router_model("claude-auto", "claude-opus-4-8", "claude-sonnet-4-6"),
+                ],
+            ),
+            (
+                "composite -> stage",
+                vec![
+                    composite_model("claude-composite", "claude-auto"),
+                    router_model("claude-auto", "claude-opus-4-8", "claude-sonnet-4-6"),
                 ],
             ),
             (
@@ -9144,10 +9266,71 @@ target = "judge-alias"
             super::DEFAULT_GATED_MAX_DURATION_MS
         );
         assert_eq!(stage.max_judge_calls, super::DEFAULT_MAX_JUDGE_CALLS);
+        assert_eq!(
+            classifier.classify_trigger,
+            super::ClassifyTrigger::EveryRequest,
+            "an omitted trigger judges every turn that reaches the classifier"
+        );
         assert!(
             router.is_driven(),
             "a classifier table is what moves an entry to the driven lane"
         );
+    }
+
+    /// `classify_trigger` on `[router.classifier]` is only ever set
+    /// programmatically elsewhere in the suite, which leaves the serde name
+    /// itself unproven: rename the field and every other test stays green while
+    /// every operator's TOML stops loading. This is the test that writes the
+    /// key the way an operator does.
+    #[test]
+    fn the_classifier_table_reads_its_trigger_from_toml() {
+        let router = parsed_router(
+            r#"
+id = "claude-auto"
+[router]
+type = "stage_router"
+capable_target = "claude-opus-4-8"
+efficient_target = "claude-sonnet-4-6"
+[router.classifier]
+target = "judge-alias"
+classify_trigger = "user_turn"
+"#,
+        );
+
+        let stage = router.stage().expect("a stage table");
+        let classifier = stage.classifier.as_ref().expect("a classifier table");
+        assert_eq!(
+            classifier.classify_trigger,
+            super::ClassifyTrigger::UserTurn,
+            "the operator's spelling is the one serde reads"
+        );
+    }
+
+    /// The other half of that key's contract: `skip_serializing_if` means an
+    /// omitted trigger has to round-trip as omitted rather than reappear as an
+    /// explicit `every_request` in an emitted config.
+    #[test]
+    fn an_omitted_classifier_trigger_round_trips_as_omitted() {
+        let router = parsed_router(
+            r#"
+id = "claude-auto"
+[router]
+type = "stage_router"
+capable_target = "claude-opus-4-8"
+efficient_target = "claude-sonnet-4-6"
+[router.classifier]
+target = "judge-alias"
+"#,
+        );
+
+        let emitted = toml::to_string(&router).expect("the router table serializes");
+        assert!(
+            !emitted.contains("classify_trigger"),
+            "an omitted trigger must round-trip as omitted: {emitted}"
+        );
+        let reparsed: super::RouterConfig =
+            toml::from_str(&emitted).expect("the emitted table parses back");
+        assert_eq!(reparsed, router, "the table survives a round trip");
     }
 
     /// Zero is the one value that turns a bound into no bound at all — a
@@ -9199,6 +9382,7 @@ target = "judge-alias"
             stage_mut(&mut model).classifier = Some(super::StageClassifierConfig {
                 target: "judge-alias".to_string(),
                 base_threshold: value,
+                classify_trigger: Default::default(),
             });
             let mut config = Config {
                 models: vec![judge_model(), model],
@@ -9229,6 +9413,7 @@ target = "judge-alias"
         stage_mut(&mut model).classifier = Some(super::StageClassifierConfig {
             target: "   ".to_string(),
             base_threshold: 0.5,
+            classify_trigger: Default::default(),
         });
         let config = Config {
             models: vec![model],
@@ -9246,6 +9431,7 @@ target = "judge-alias"
             stage_mut(&mut model).classifier = Some(super::StageClassifierConfig {
                 target: target.to_string(),
                 base_threshold: 0.5,
+                classify_trigger: Default::default(),
             });
             let config = Config {
                 models: vec![
@@ -9429,6 +9615,7 @@ target = "judge-alias"
         stage_mut(&mut model).classifier = Some(super::StageClassifierConfig {
             target: target.to_string(),
             base_threshold: 0.5,
+            classify_trigger: Default::default(),
         });
         model
     }

@@ -157,6 +157,11 @@ pub(super) async fn forward(
     // injects nothing. Every other request gates against the chain it already
     // resolved and allocates nothing here.
     //
+    // Which envelope depends on *what* decides: the entry's own router names
+    // the targets and judge a `Router`/`StageClassifier` turn can reach, while
+    // an `Overlay` turn is decided before the router is consulted at all and
+    // must be gated on the overlay's list instead (`routing::envelope`).
+    //
     // The prefill lane is the second case, with local inference in place of
     // the judge call: the chain resolved above names only the entry's default
     // target, and the drive that picks the real one has not run yet — it
@@ -164,11 +169,22 @@ pub(super) async fn forward(
     // algorithm writes a session affinity as it decides. So the request is
     // admitted against every target the entry can name (#633).
     let envelope;
-    let admission: &[routing::Route] = if (driven.is_some() && consult.is_some()) || drive_prefill {
-        envelope = routing::envelope::dependency_envelope(&state.config, model_key);
-        &envelope
-    } else {
-        &routes
+    let admission: &[routing::Route] = match consult.map(|consult| consult.kind) {
+        Some(
+            routing::stage::ConsultKind::StageClassifier | routing::stage::ConsultKind::Router,
+        ) => {
+            envelope = routing::envelope::dependency_envelope(&state.config, model_key);
+            &envelope
+        }
+        Some(routing::stage::ConsultKind::Overlay) => {
+            envelope = routing::envelope::overlay_envelope(&state.config, model_key);
+            &envelope
+        }
+        None if drive_prefill => {
+            envelope = routing::envelope::dependency_envelope(&state.config, model_key);
+            &envelope
+        }
+        None => &routes,
     };
     let (base_headers, inbound) =
         check_inbound_auth(&state, admission, headers).map_err(|error| *error)?;
@@ -198,9 +214,11 @@ pub(super) async fn forward(
     // The drive. Between admission and the pin commit, because both boundaries
     // matter: a refused caller must spend no judge call, and the pin must
     // record the tier the turn was actually dispatched at.
-    if let (Some((stage_cfg, classifier)), Some(consult), Some(outcome)) =
-        (driven, consult, router_outcome.as_mut())
-    {
+    if let (Some((stage_cfg, classifier)), Some(consult), Some(outcome)) = (
+        driven,
+        consult.filter(|consult| consult.kind == routing::stage::ConsultKind::StageClassifier),
+        router_outcome.as_mut(),
+    ) {
         let bounds = stage_cfg.bounds();
         let verdict = if consult.judge_calls_used >= bounds.max_judge_calls {
             // Checked before the call is charged, so the budget is a ceiling on
@@ -248,6 +266,50 @@ pub(super) async fn forward(
             if let Some(pin) = pending.as_mut() {
                 pin.set_tier(tier);
             }
+        }
+    }
+    // The driven lane's own drive, on the same two boundaries: after
+    // admission, before the answer. Unlike the stage judge above it produces a
+    // target rather than a tier, because the algorithm — not shunt — owns both
+    // the verdict and the fallback (`routing::driven`). It writes no pin:
+    // libsy keeps this entry's session state inside the algorithm instance,
+    // which is why that instance is long-lived.
+    if let (Some(kind), Some(outcome)) =
+        (consult.map(|consult| consult.kind), router_outcome.as_mut())
+    {
+        let entry = match kind {
+            routing::stage::ConsultKind::Router => state.driven_routers.router(model_key),
+            routing::stage::ConsultKind::Overlay => state.driven_routers.overlay(model_key),
+            routing::stage::ConsultKind::StageClassifier => None,
+        };
+        if let Some(entry) = entry {
+            // Cloned so the mint's borrow is of a local, leaving `outcome`
+            // free to be rewritten by the decision below.
+            let router_id = outcome.model.clone();
+            let admitted =
+                crate::routing::serve::AdmittedContext::mint(&inbound, headers, &router_id);
+            let decision =
+                routing::driven::drive(&state, &admitted, entry, body.json(), headers).await;
+            routes = routing::resolve_target_chain(&state.config, &decision.target, &router_id);
+            outcome.target = decision.target;
+            outcome.source = decision.source;
+            // Recorded on every outcome, the budget-exhausted one included, so
+            // the series totals to "turns that wanted a judge".
+            crate::metrics::record_judge_call(
+                &router_id,
+                entry.algorithm_label(),
+                decision.judge_outcome,
+            );
+            // Labels only — never the verdict text or any message content:
+            // this line rides into every log sink the operator configured, and
+            // the judge is reading the caller's transcript.
+            tracing::info!(
+                router = %router_id,
+                algorithm = entry.algorithm_label(),
+                outcome = decision.judge_outcome,
+                source = decision.source.as_label(),
+                "drove the router's judge"
+            );
         }
     }
     // The prefill drive, on the same side of admission as the judge and for
