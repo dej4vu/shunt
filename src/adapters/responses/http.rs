@@ -13,8 +13,8 @@ use axum::{
 
 use crate::{
     adapters::{
-        collect_upstream_body, idle_error, mark_body_broke, too_large_error, AdapterError,
-        UpstreamBodyError,
+        collect_upstream_sse_body, idle_error, mark_body_broke, too_large_error, AdapterError,
+        ResponseBounds, UpstreamBodyError,
     },
     auth::Credential,
     model::responses::{parse_sse_events, AnthropicSseMachine},
@@ -175,7 +175,7 @@ pub(super) async fn forward_http(
         upstream,
         turn.relay(route),
         input_tokens_estimate,
-        turn.response_byte_cap,
+        turn.response_bounds,
     )
     .await?;
     Ok((response.status(), response))
@@ -221,7 +221,7 @@ pub(super) async fn json_response(
     upstream: reqwest::Response,
     relay: RelayOptions,
     input_tokens_estimate: u64,
-    response_byte_cap: Option<usize>,
+    bounds: ResponseBounds,
 ) -> Result<axum::response::Response, AdapterError> {
     // This is the one Responses path that buffers a whole upstream reply, so
     // it is the one that has to honour `judge_max_response_bytes`. A judge call
@@ -229,12 +229,16 @@ pub(super) async fn json_response(
     // every internal call through a `kind = "responses"` target lands here —
     // and reading it with `text()` would let a judge allocate without bound
     // until the deadline instead of failing open at the configured limit.
-    // `None` is the client path and stays byte-for-byte what it was.
-    let body = match collect_upstream_body(upstream, response_byte_cap, None).await {
+    // The idle gap bites here for the same reason on a gated call: this read
+    // finishes before `run_chain` returns, so an upstream that commits its
+    // headers and stalls would otherwise hold the turn until
+    // `gated_max_duration_ms`. The body is SSE, so the gap is measured
+    // between completed content frames: keep-alive pings alone do not hold a
+    // stalled turn open. The default is the client path and stays
+    // byte-for-byte what it was.
+    let body = match collect_upstream_sse_body(upstream, bounds.max_bytes, bounds.idle).await {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(UpstreamBodyError::TooLarge(too_large)) => return Err(too_large_error(too_large)),
-        // Unreachable while this read passes no idle gap (#666); kept a typed
-        // refusal rather than a panic.
         Err(UpstreamBodyError::Idle(idle)) => return Err(idle_error(idle)),
         // Only ever a successful reply here: a turn cut before its terminal
         // event, which `routing::serve` reads back through the marker.
@@ -322,7 +326,7 @@ mod tests {
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"Upstream failed\"}}}\n\n",
         );
         let upstream = upstream_response(200, sse).await;
-        let error = json_response(upstream, relay_opts(), 0, None)
+        let error = json_response(upstream, relay_opts(), 0, ResponseBounds::default())
             .await
             .expect_err("backend error event should stop failover");
 
@@ -347,7 +351,7 @@ mod tests {
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached\"}}}\n\n",
         );
         let upstream = upstream_response(200, sse).await;
-        let error = json_response(upstream, relay_opts(), 0, None)
+        let error = json_response(upstream, relay_opts(), 0, ResponseBounds::default())
             .await
             .expect_err("in-stream rate limit is an error");
 
@@ -375,7 +379,7 @@ mod tests {
                 .body(reqwest::Body::wrap_stream(chunks))
                 .unwrap(),
         );
-        let error = json_response(upstream, relay_opts(), 0, None)
+        let error = json_response(upstream, relay_opts(), 0, ResponseBounds::default())
             .await
             .expect_err("a broken body is an error");
 
@@ -386,6 +390,115 @@ mod tests {
             .extensions()
             .get::<crate::adapters::UpstreamBodyBroke>()
             .is_some());
+    }
+
+    /// A `200` SSE reply built in-process whose chunks arrive on the clock: each
+    /// `(delay, bytes)` is yielded `delay` after the one before it.
+    fn timed_sse_upstream<S>(chunks: S) -> reqwest::Response
+    where
+        S: futures_util::Stream<Item = (std::time::Duration, &'static [u8])> + Send + 'static,
+    {
+        use futures_util::StreamExt;
+        let chunks = chunks.then(|(delay, chunk)| async move {
+            tokio::time::sleep(delay).await;
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(chunk))
+        });
+        reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(reqwest::Body::wrap_stream(chunks))
+                .unwrap(),
+        )
+    }
+
+    /// A gated read's idle gap is measured between completed content frames:
+    /// an upstream that commits its headers and then sends nothing but
+    /// keep-alives — comment frames and `event: ping` — well inside the gap is
+    /// still cut at the gap, not held until the call's wall-clock bound.
+    ///
+    /// Non-vacuity: refresh the deadline on every chunk in
+    /// `collect_bounded_body` and the keep-alives hold the read open forever,
+    /// so the outer timeout fires and this goes red.
+    #[tokio::test(start_paused = true)]
+    async fn json_response_cuts_a_keep_alive_only_body_at_the_idle_gap() {
+        let tick = std::time::Duration::from_millis(50);
+        let keep_alives: [&'static [u8]; 2] = [b": keep-alive\n\n", b"event: ping\ndata: {}\n\n"];
+        let upstream = timed_sse_upstream(futures_util::stream::iter(
+            keep_alives
+                .into_iter()
+                .cycle()
+                .map(move |chunk| (tick, chunk)),
+        ));
+        let idle = std::time::Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            json_response(
+                upstream,
+                relay_opts(),
+                0,
+                ResponseBounds {
+                    max_bytes: None,
+                    idle: Some(idle),
+                },
+            ),
+        )
+        .await
+        .expect("keep-alives alone must not hold the read past the idle gap")
+        .expect_err("a body that only keeps alive is cut at the idle gap");
+
+        assert_eq!(
+            error
+                .response
+                .extensions()
+                .get::<crate::adapters::UpstreamBodyIdle>(),
+            Some(&crate::adapters::UpstreamBodyIdle { idle }),
+            "got: {}",
+            error.message
+        );
+        assert!(error.failure.is_none());
+        assert_eq!(
+            started.elapsed(),
+            idle,
+            "cut at the gap armed after the headers"
+        );
+    }
+
+    /// A content frame split across two chunks is progress once its second
+    /// half completes it: each half arrives inside the gap, the frame they
+    /// complete re-arms it, and the turn finishes even though it spans more
+    /// than one gap end to end.
+    #[tokio::test(start_paused = true)]
+    async fn json_response_counts_a_split_content_frame_as_progress() {
+        let gap = std::time::Duration::from_millis(200);
+        let upstream = timed_sse_upstream(futures_util::stream::iter([
+            (
+                std::time::Duration::from_millis(50),
+                &b"event: response.created\ndata: {\"response\":{\"id\":\"resp_1\"}}\n\nevent: response.output_item.added\ndata: {\"item\":{\"type\":\"message\"}}\n\n"[..],
+            ),
+            (gap, &b"event: response.output_text.delta\ndata: {\"del"[..]),
+            (gap, &b"ta\":\"hello\"}\n\n"[..]),
+            (
+                gap + gap,
+                &b"event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"[..],
+            ),
+        ]));
+        let response = json_response(
+            upstream,
+            relay_opts(),
+            0,
+            ResponseBounds {
+                max_bytes: None,
+                idle: Some(std::time::Duration::from_millis(500)),
+            },
+        )
+        .await
+        .expect("a turn whose frames keep completing inside the gap finishes");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body_json(response).await;
+        assert_eq!(body["content"][0]["text"], "hello");
     }
 
     /// A clean turn still returns the collected Anthropic message as `200 OK` —
@@ -405,7 +518,7 @@ mod tests {
             "data: {\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
         );
         let upstream = upstream_response(200, sse).await;
-        let response = json_response(upstream, relay_opts(), 0, None)
+        let response = json_response(upstream, relay_opts(), 0, ResponseBounds::default())
             .await
             .expect("json_response builds a response");
 
@@ -436,7 +549,7 @@ mod tests {
             "data: {\"delta\":\"partial\"}\n\n",
         );
         let upstream = upstream_response(200, sse).await;
-        let response = json_response(upstream, relay_opts(), 0, None)
+        let response = json_response(upstream, relay_opts(), 0, ResponseBounds::default())
             .await
             .expect("json_response builds a response");
 
@@ -472,7 +585,7 @@ mod tests {
             ..relay_opts()
         };
         let upstream = upstream_response(200, sse).await;
-        let response = json_response(upstream, relay, 11, None)
+        let response = json_response(upstream, relay, 11, ResponseBounds::default())
             .await
             .expect("json_response builds a response");
 
@@ -590,7 +703,7 @@ mod tests {
                 thinking_enabled: false,
                 tool_search_native: false,
                 stop_sequences: Vec::new(),
-                response_byte_cap: None,
+                response_bounds: ResponseBounds::default(),
             },
             codex_quota_account: None,
             estimate_input: None,
@@ -656,7 +769,7 @@ mod tests {
                 thinking_enabled: false,
                 tool_search_native: false,
                 stop_sequences: Vec::new(),
-                response_byte_cap: None,
+                response_bounds: ResponseBounds::default(),
             },
             codex_quota_account: None,
             estimate_input: None,
